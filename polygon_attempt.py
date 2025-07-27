@@ -1,4 +1,4 @@
-import os, time
+import os, time 
 import pandas as pd
 import numpy as np
 import requests
@@ -7,6 +7,8 @@ from scipy.stats import norm
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from pandas.tseries.offsets import BDay
+
+np.random.seed(42)
 
 API_KEY = os.getenv('POLYGON_API_KEY', 'vbGmuUKSvRTv651AKaU6wweNTMAn2caB')
 BASE_URL = 'https://api.polygon.io'
@@ -126,7 +128,11 @@ def run_backtest(*,
     ).dropna(subset=['option_symbol']).reset_index()
     df = df.rename(columns={'price':'underlying_price'})
 
-    df['bid'], df['ask'] = df['open'], df['close']
+    mid = 0.005 * np.round((df['open'] + df['close']) / 2 / 0.005)
+
+    # 1b) enforce a fixed $0.01 spread
+    df['bid'] = np.round(mid - 0.005,3)
+    df['ask'] = np.round(mid + 0.005,3)
     df['T'] = (df['expiry_date'] - df['datetime']).dt.total_seconds() / (365*24*3600)
     ret = np.log(df['underlying_price']).diff()
     alpha = 1 - np.exp(np.log(0.5) / vol_half_life_min)
@@ -139,143 +145,202 @@ def run_backtest(*,
     df['edge'] = np.maximum(df['bs_price'] - df['ask'], df['bid'] - df['bs_price'])
 
     # --- (2) Initialize trade logging, position/book, and ID counter ---
+    df['available'] = np.random.randint(1, 6, size=len(df))
     trade_logs  = []
     strike_key  = f"{symbol}_{strike:.3f}_{option_type}"
     positions   = {strike_key: 0}
     book        = {strike_key: []}
     next_id     = 1
+    
+    
 
-    # --- (3) The minute‐by‐minute loop ---
-    for _, row in tqdm(df.iterrows(), total=len(df), desc='Trading'):
-        curr_qty = positions[strike_key]
-        total_avail = int(row['volume']) if not np.isnan(row['volume']) else 0
-        edge       = row['edge']
-        bs_ask     = row['bs_price'] - row['ask']
-        bs_bid     = row['bid']      - row['bs_price']
+     # --- GROUP BY EXPIRY / OPTION SYMBOL ---
+    for opt_sym, subdf in tqdm(df.groupby('option_symbol'), desc='Expiry Groups'):
+        subdf = subdf.sort_index()
+        subdf = subdf[subdf['T'] > 0]
 
-        exit_signal = get_exit_signal(edge, edge_exit)
+        # Initialize per-expiry state
+        positions = {opt_sym: 0}
+        book      = {opt_sym: []}
 
-        # PHASE A: CLOSE?
-        want_close = (
-            (curr_qty > 0 and exit_signal in (1,2)) or
-            (curr_qty < 0 and exit_signal in (-1,2))
-        )
+        # Iterate minute-by-minute for this contract
+        for ts, row in subdf.iterrows():
+            edge       = row['edge']
+            bs_ask     = row['bs_price'] - row['ask']
+            bs_bid     = row['bid']      - row['bs_price']
+            curr_qty   = positions[opt_sym]
+            total_avail= int(row['available'])
 
-        if want_close and curr_qty != 0 and total_avail > 0:
+            if ts in [subdf.index[-2], subdf.index[-1]]:
+                exit_signal = 2
+            else:
+                exit_signal = get_exit_signal(edge, edge_exit)
+
+            # PHASE A: CLOSE?
+            if ((curr_qty > 0 and exit_signal in (1,2)) or
+                (curr_qty < 0 and exit_signal in (-1,2))) and curr_qty != 0 and total_avail > 0:
+
+                to_close = abs(curr_qty)
+                closed   = 0
+                pnl      = 0.0
+                close_ids= []
+                price    = row['bid'] if curr_qty>0 else row['ask']
+
+                # FIFO‐close with sign‑aware P&L
+                while closed < to_close and book[opt_sym] and closed < total_avail:
+                    lot         = book[opt_sym].pop(0)
+                    lot_qty     = lot['qty']
+                    entry_price = lot['price']
+
+                    if lot_qty > 0:
+                        pnl += lot_qty * (price - entry_price) * 100
+                    else:
+                        pnl += (-lot_qty) * (entry_price - price) * 100
+
+                    close_ids.append(lot['id'])
+                    closed += abs(lot_qty)
+
+                pnl = round(pnl, 1)
+
+                # Log the aggregate close
+                this_id = next_id; next_id += 1
+                trade_logs.append({
+                    'id':               this_id,
+                    'timestamp':        row['datetime'],
+                    'symbol':           opt_sym,
+                    'action':           'close',
+                    'side':             'sell' if curr_qty>0 else 'buy',
+                    'price':            price,
+                    'quantity':         closed,
+                    'position_after':   curr_qty - np.sign(curr_qty)*closed,
+                    'corresponding_ids':close_ids,
+                    'pnl':              pnl
+                })
+
+                positions[opt_sym] = curr_qty - np.sign(curr_qty)*closed
+                total_avail      -= closed
+            
+            is_final_two = ts in [subdf.index[-2], subdf.index[-1]]
+            # PHASE B: OPEN from flat
+            if not is_final_two and curr_qty == 0 and total_avail > 0:
+                # determine size as before
+                size = (
+                    3 if abs(edge) >= 2*edge_entry else
+                    2 if abs(edge) >= 1.5*edge_entry else
+                    1 if abs(edge) >= edge_entry else
+                    0
+                )
+                size = min(size, total_avail, max_pos)
+                if size > 0:
+                    open_qty = np.sign(edge) * size
+                    price    = row['ask'] if open_qty>0 else row['bid']
+                    side     = 'buy' if open_qty>0 else 'sell'
+                    this_id  = next_id; next_id += 1
+
+                    trade_logs.append({
+                        'id':               this_id,
+                        'timestamp':        row['datetime'],
+                        'symbol':           opt_sym,
+                        'action':           'open',
+                        'side':             side,
+                        'price':            price,
+                        'quantity':         abs(open_qty),
+                        'position_after':   open_qty,
+                        'corresponding_ids':[],
+                        'pnl':              0.0
+                    })
+                    book[opt_sym].append({'id': this_id, 'qty': open_qty, 'price': price})
+                    curr_qty = open_qty
+                    positions[opt_sym] = curr_qty
+                    total_avail -= abs(open_qty)
+
+            # PHASE C: ADD to existing (only if we didn't just open)
+            if not is_final_two and curr_qty != 0 and total_avail > 0:
+                # only add if edge still favors same side
+                if (curr_qty > 0 and bs_ask  > edge_entry) or (curr_qty < 0 and bs_bid  > edge_entry):
+                    # compute tiered desired position
+                    tier    = 3 if abs(edge) >= 2*edge_entry else \
+                            2 if abs(edge) >= 1.5*edge_entry else \
+                            1
+                    desired = np.sign(curr_qty) * min(tier, max_pos)
+                    delta   = desired - curr_qty
+                    # **only proceed if delta would increase magnitude** (same sign)
+                    if delta * curr_qty > 0:
+                        add_amt = int(np.sign(delta) * min(abs(delta), total_avail))
+                        if add_amt != 0:
+                            price   = row['ask'] if add_amt > 0 else row['bid']
+                            side    = 'buy'   if add_amt > 0 else 'sell'
+                            this_id = next_id; next_id += 1
+
+                            trade_logs.append({
+                                'id':               this_id,
+                                'timestamp':        row['datetime'],
+                                'symbol':           opt_sym,
+                                'action':           'add',
+                                'side':             side,
+                                'price':            price,
+                                'quantity':         abs(add_amt),
+                                'position_after':   curr_qty + add_amt,
+                                'corresponding_ids':[],
+                                'pnl':              0.0
+                            })
+                            book[opt_sym].append({'id': this_id, 'qty': add_amt, 'price': price})
+                            curr_qty           += add_amt
+                            positions[opt_sym] = curr_qty
+                            total_avail        -= abs(add_amt)
+
+    # --- Post‑day forced close for leftovers ---
+        curr_qty = positions[opt_sym]
+        if curr_qty != 0 and book[opt_sym]:
+            last   = subdf.iloc[-1]
+            price  = np.round((last.bid + last.ask) / 2,3)
             to_close = abs(curr_qty)
-            closed = 0
-            pnl = 0.0
-            close_ids = []
-            price = row['bid'] if curr_qty>0 else row['ask']
-            # FIFO through the book
-            while closed < to_close and book[strike_key] and closed < total_avail:
-                lot = book[strike_key].pop(0)
-                closed += abs(lot['qty'])
-                pnl += lot['qty'] * (price - lot['price']) * 100
-                close_ids.append(lot['id'])
-            pnl = round(pnl)
+            closed   = 0
+            pnl      = 0.0
+            close_ids= []
 
-            # log one aggregate close
+            while closed < to_close and book[opt_sym]:
+                lot         = book[opt_sym].pop(0)
+                lot_qty     = lot['qty']
+                entry_price = lot['price']
+
+                if lot_qty > 0:
+                    pnl += lot_qty * (price - entry_price) * 100
+                else:
+                    pnl += (-lot_qty) * (entry_price - price) * 100
+
+                close_ids.append(lot['id'])
+                closed += abs(lot_qty)
+
             this_id = next_id; next_id += 1
             trade_logs.append({
                 'id':               this_id,
-                'timestamp':        row['datetime'],
-                'symbol':           strike_key,
+                'timestamp':        last['datetime'],
+                'symbol':           opt_sym,
                 'action':           'close',
                 'side':             'sell' if curr_qty>0 else 'buy',
                 'price':            price,
                 'quantity':         closed,
-                'position_after':   curr_qty - np.sign(curr_qty)*closed,
+                'position_after':   0,
                 'corresponding_ids':close_ids,
-                'pnl':              pnl
+                'pnl':              round(pnl,1)
             })
-
-            # update position & remaining volume
-            curr_qty -= np.sign(curr_qty) * closed
-            positions[strike_key] = curr_qty
-            total_avail -= closed
-            # fall through to Phase B if flat
-
-        # PHASE B: OPEN from flat
-        opened_this_bar = False
-        if curr_qty == 0 and total_avail > 0:
-            # determine size as before
-            size = (
-                3 if abs(edge) >= 2*edge_entry else
-                2 if abs(edge) >= 1.5*edge_entry else
-                1 if abs(edge) >= edge_entry else
-                0
-            )
-            size = min(size, total_avail, max_pos)
-            if size > 0:
-                open_qty = np.sign(edge) * size
-                price    = row['ask'] if open_qty>0 else row['bid']
-                side     = 'buy' if open_qty>0 else 'sell'
-                this_id  = next_id; next_id += 1
-
-                trade_logs.append({
-                    'id':               this_id,
-                    'timestamp':        row['datetime'],
-                    'symbol':           strike_key,
-                    'action':           'open',
-                    'side':             side,
-                    'price':            price,
-                    'quantity':         abs(open_qty),
-                    'position_after':   open_qty,
-                    'corresponding_ids':[],
-                    'pnl':              0.0
-                })
-                book[strike_key].append({'id': this_id, 'qty': open_qty, 'price': price})
-                curr_qty = open_qty
-                positions[strike_key] = curr_qty
-                total_avail -= abs(open_qty)
-                opened_this_bar = True
-
-        # PHASE C: ADD to existing (only if we didn't just open)
-        if curr_qty != 0 and total_avail > 0:
-            # only add if edge still favors same side
-            if (curr_qty > 0 and bs_ask  > edge_entry) or (curr_qty < 0 and bs_bid  > edge_entry):
-                # compute tiered desired position
-                tier    = 3 if abs(edge) >= 2*edge_entry else \
-                        2 if abs(edge) >= 1.5*edge_entry else \
-                        1
-                desired = np.sign(curr_qty) * min(tier, max_pos)
-                delta   = desired - curr_qty
-                # **only proceed if delta would increase magnitude** (same sign)
-                if delta * curr_qty > 0:
-                    add_amt = int(np.sign(delta) * min(abs(delta), total_avail))
-                    if add_amt != 0:
-                        price   = row['ask'] if add_amt > 0 else row['bid']
-                        side    = 'buy'   if add_amt > 0 else 'sell'
-                        this_id = next_id; next_id += 1
-
-                        trade_logs.append({
-                            'id':               this_id,
-                            'timestamp':        row['datetime'],
-                            'symbol':           strike_key,
-                            'action':           'add',
-                            'side':             side,
-                            'price':            price,
-                            'quantity':         abs(add_amt),
-                            'position_after':   curr_qty + add_amt,
-                            'corresponding_ids':[],
-                            'pnl':              0.0
-                        })
-                        book[strike_key].append({'id': this_id, 'qty': add_amt, 'price': price})
-                        curr_qty           += add_amt
-                        positions[strike_key] = curr_qty
-                        total_avail        -= abs(add_amt)
+            positions[opt_sym] = 0
 
     # --- (4) Build trades_df & back‑fill opens’ corresponding_ids ---
     trades_df = pd.DataFrame(trade_logs)
-    # map open_id → [close_ids…]
+
+    # Rebuild close_map globally
     close_map = {}
     for _, r in trades_df[trades_df.action=='close'].iterrows():
-        for oid in r.corresponding_ids:
-            close_map.setdefault(oid, []).append(r.id)
-    # assign to opens
-    is_open_or_add = trades_df.action.isin(['open', 'add'])
-    trades_df.loc[is_open_or_add, 'corresponding_ids'] = trades_df.id.map(lambda oid: close_map.get(oid, []))
+        for oid in r['corresponding_ids']:
+            close_map.setdefault(oid, []).append(r['id'])
+
+    # Assign clean mappings to opens/adds
+    mask = trades_df.action.isin(['open', 'add'])
+    trades_df.loc[mask, 'corresponding_ids'] = (
+        trades_df.loc[mask, 'id'].map(lambda oid: close_map.get(oid, []))
+    )
 
     trades_df.to_csv('trades.csv', index=False)
 
@@ -290,7 +355,6 @@ def run_backtest(*,
         pnl_daily.to_csv('daily_pnl.csv', index=False)
     else:
         pnl_daily = pd.DataFrame(columns=['datetime','daily_pnl','cumulative_pnl'])
-
     plt.figure(figsize=(10,4))
     plt.plot(pnl_daily['datetime'], pnl_daily['cumulative_pnl'], label='Cumulative PnL')
     plt.title(f"{symbol} {option_type.title()} {strike} backtest")
@@ -302,4 +366,5 @@ def run_backtest(*,
 
 
 if __name__=='__main__':
-    run_backtest(fetch_data=False)
+    a, b, c = run_backtest(fetch_data=False)
+    a.to_csv('bid_asks.csv', index=False)
