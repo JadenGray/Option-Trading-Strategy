@@ -30,14 +30,15 @@ def fill_option_bars_with_mids(df, time_thr=5, vol_col='sigma'):
                 # choose target for the expected price
                 if minutes_to_next <= time_thr:
                     target = nxt.mid # move towards next available price
-                    frac   = 0.5
+                    frac   = 0.33
                 else:
                     target = curr.bs_price # move towards theoretical price (feels like cheating seems like a reasonable way to fill data)
-                    frac   = 0.25 # don't move as far towards
+                    frac   = 0.1 # don't move as far towards
                 centre = mid_curr + frac * (target - mid_curr) # compute expectation of next price
-                # simulate some noise
-                var    = curr[vol_col] ** 2
-                mid_s  = np.round(np.random.normal(centre, np.sqrt(var)), 2)
+                # simulate some noise - assume option price 10x as volatile as underlying
+                minutes_per_year = 252 * 6.5 * 60 # trading minutes
+                price_sd = 10 * mid_curr * curr[vol_col] * np.sqrt(1 / minutes_per_year)
+                mid_s  = np.round(np.random.normal(centre, price_sd), 2)
                 filled.append(
                     pd.Series({
                         'datetime':      ts,
